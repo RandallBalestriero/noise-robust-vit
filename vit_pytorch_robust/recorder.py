@@ -2,13 +2,15 @@ from functools import wraps
 import torch
 from torch import nn
 
-from vit_pytorch.vit import Attention
+from vit_pytorch_robust.vit import Attention
+
 
 def find_modules(nn_module, type):
     return [module for module in nn_module.modules() if isinstance(module, type)]
 
+
 class Recorder(nn.Module):
-    def __init__(self, vit, device = None):
+    def __init__(self, vit, device=None):
         super().__init__()
         self.vit = vit
 
@@ -44,7 +46,7 @@ class Recorder(nn.Module):
         self.recordings.append(recording)
 
     def forward(self, img):
-        assert not self.ejected, 'recorder has been ejected, cannot be used anymore'
+        assert not self.ejected, "recorder has been ejected, cannot be used anymore"
         self.clear()
         if not self.hook_registered:
             self._register_hook()
@@ -55,5 +57,5 @@ class Recorder(nn.Module):
         target_device = self.device if self.device is not None else img.device
         recordings = tuple(map(lambda t: t.to(target_device), self.recordings))
 
-        attns = torch.stack(recordings, dim = 1) if len(recordings) > 0 else None
+        attns = torch.stack(recordings, dim=1) if len(recordings) > 0 else None
         return pred, attns

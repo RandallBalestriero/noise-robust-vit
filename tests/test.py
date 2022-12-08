@@ -1,5 +1,5 @@
 import torch
-from vit_pytorch import ViT
+from vit_pytorch_robust import ViT
 
 def test():
     v = ViT(
