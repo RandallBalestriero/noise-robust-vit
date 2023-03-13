@@ -237,10 +237,11 @@ def shifted_window_attention(
         attn = attn.view(-1, num_heads, x.size(1), x.size(1))
 
     if robust:
-        attn = torch.softmax(attn, dim=-1)
+        attn = torch.nn.functional.softmax(attn, dim=-1)
         for _ in range(3):
             attn = attn.div(torch.sum(attn, dim=-1, keepdim=True))
             attn = attn.div(torch.sum(attn, dim=-2, keepdim=True))
+        attn = attn.div(torch.sum(attn, dim=-1, keepdim=True))
     else:
         attn = F.softmax(attn, dim=-1)
 

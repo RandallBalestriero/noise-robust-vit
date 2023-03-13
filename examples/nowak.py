@@ -2,22 +2,75 @@ import torch
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
-from vit_pytorch_robust import levit, vit, datasets, swin_t, patch_convnet
-from vit_pytorch_robust.utils import rand_bbox
+from torchvision.datasets import ImageFolder
 
 import argparse
-from pathlib import Path
-import numpy as np
 import submitit
 import omega
-import logging
+import pathlib
+
+
+class PartialSyncBatchNorm(torch.nn.SyncBatchNorm):
+    def forward(self, x):
+        N = x.size(0)
+        P = torch.distributed.get_world_size()
+
+        first, second = x.split(N // 2)
+
+        # first part is original
+        first_out = super().forward(first)
+
+        # second part
+        sum = first.mean((0, 2, 3), keepdims=True) / P
+        ssum = first.square().mean((0, 2, 3), keepdims=True) / P
+        torch.distributed.all_reduce(sum)
+        torch.distributed.all_reduce(ssum)
+
+        std = torch.sqrt(ssum - sum.square() + self.eps)
+        second_out = self.weight.view_as(std) * (
+            second - sum
+        ) / std + self.bias.view_as(std)
+        return torch.cat([first_out, second_out], 0)
+
+
+class PartialReLU(torch.nn.ReLU):
+    def forward(self, x):
+        N = x.size(0)
+        with torch.no_grad():
+            mask = (
+                x[: N // 2]
+                .gt(0.0)
+                .tile(2, *[1 for _ in range(x.ndim - 1)])
+                .type(dtype=x.dtype, non_blocking=True)
+            )
+        return x * mask
+
+
+def replace_modules(model):
+    model = omega.utils.replace_module(model, torch.nn.ReLU, PartialReLU)
+
+    def module_to_args_kwargs(module):
+        return [], dict(
+            num_features=module.num_features,
+            eps=module.eps,
+            momentum=module.momentum,
+            affine=module.affine,
+            process_group=module.process_group,
+        )
+
+    model = omega.utils.replace_module(
+        model, torch.nn.SyncBatchNorm, PartialSyncBatchNorm, module_to_args_kwargs
+    )
+    return model
 
 
 class Model(omega.Trainer):
     def initialize_train_loader(self):
-        train_dataset = datasets.imagenet_train_dataset(
-            Path("/datasets01/tinyimagenet/081318/")
-            # Path("/datasets01/imagenet_full_size/061417/")
+        transforms = omega.transforms.imagenet_train_dataset(
+            strength=self.args.strength
+        )
+        train_dataset = train_dataset = ImageFolder(
+            self.args.dataset_path / "train", transform=transforms
         )
         per_device_batch_size = self.args.batch_size // self.args.world_size
         if self.args.world_size > 1:
@@ -40,10 +93,8 @@ class Model(omega.Trainer):
         return train_loader
 
     def initialize_val_loader(self):
-        val_dataset = datasets.imagenet_val_dataset(
-            Path("/datasets01/tinyimagenet/081318/")
-            # Path("/datasets01/imagenet_full_size/061417/")
-        )
+        transforms = omega.transforms.imagenet_train_dataset()
+        val_dataset = ImageFolder(self.args.dataset_path / "val", transform=transforms)
         per_device_batch_size = self.args.batch_size // self.args.world_size
         if self.args.world_size > 1:
             val_sampler = torch.utils.data.distributed.DistributedSampler(
@@ -64,32 +115,15 @@ class Model(omega.Trainer):
         return val_loader
 
     def initialize_modules(self):
-        if self.args.architecture == "levit":
-            self.model = levit.LeViT_128S(
-                num_classes=self.args.num_classes, robust=self.args.robust
-            )
-            # self.model = SimpleViT(
-            #     image_size=224,
-            #     patch_size=args.ps,
-            #     num_classes=200,
-            #     dim=args.dim,
-            #     depth=args.depth,
-            #     heads=args.heads,
-            #     mlp_dim=args.mlp_dim,
-            #     robust=False,
-            # ).cuda()
-        elif self.args.architecture == "S60":
-            self.model = patch_convnet.S60(
-                num_classes=self.args.num_classes, robust=self.args.robust
-            )
-        elif self.args.architecture == "swin":
-            self.model = swin_t(
-                num_classes=self.args.num_classes, robust=self.args.robust
-            )
+        import torchvision
+
+        model = torchvision.models.__dict__[self.args.architecture]()
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        self.model = replace_modules(model)
 
     def initialize_optimizer(self):
         return optim.AdamW(
-            self.model.parameters(),
+            self.parameters(),
             lr=self.args.learning_rate,
             weight_decay=self.args.weight_decay,
             eps=1e-8,
@@ -113,31 +147,15 @@ class Model(omega.Trainer):
         return scheduler
 
     def compute_loss(self):
-
         x = self.data[0].cuda(self.this_device, non_blocking=True)
         y = self.data[1].cuda(self.this_device, non_blocking=True)
-        r = np.random.rand(1)
-        if r < self.args.cutmix_prob:
-            # generate mixed sample
-            rand_index = torch.randperm(x.size()[0]).cuda(set_to_none=True)
-            lam = np.random.beta(self.args.beta, self.args.beta)
-            bbx1, bby1, bbx2, bby2 = rand_bbox(x.size(), lam)
-            x[:, :, bbx1:bbx2, bby1:bby2] = x[rand_index, :, bbx1:bbx2, bby1:bby2]
-            # adjust lambda to exactly match pixel ratio
-            lam = 1 - (bbx2 - bbx1) * (bby2 - bby1) / (x.size(-1) * x.size(-2))
-
-        preds = self.model(x)
-        if r < self.args.cutmix_prob:
-            loss = torch.nn.functional.cross_entropy(
-                preds, y, label_smoothing=0.1
-            ) * lam + torch.nn.functional.cross_entropy(
-                preds, y[rand_index], label_smoothing=0.1
-            ) * (
-                1 - lam
-            )
+        N = x.size(0)
+        eps = torch.randn_like(x) * self.args.noise_std
+        preds = self.model(torch.cat([x + eps, x], 0))
+        if self.args.improved:
+            loss = torch.nn.functional.cross_entropy(preds[N:], y, label_smoothing=0.1)
         else:
-            loss = torch.nn.functional.cross_entropy(preds, y, label_smoothing=0.1)
-
+            loss = torch.nn.functional.cross_entropy(preds[:N], y, label_smoothing=0.1)
         return loss
 
     def before_eval_epoch(self):
@@ -146,10 +164,9 @@ class Model(omega.Trainer):
         self.counter = 0
 
     def eval_step(self):
-
         x = self.data[0].cuda(self.this_device, non_blocking=True)
         y = self.data[1].cuda(self.this_device, non_blocking=True)
-        preds = self.model(x)
+        preds = self.model(torch.cat([x, x], 0))[: x.size(0)]
         accu = preds.argmax(1).eq(y).float().mean()
         torch.distributed.reduce(accu, dst=0)
         self.accu += accu.item()
@@ -169,33 +186,32 @@ class Model(omega.Trainer):
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="DDP Training")
-    parser.add_argument("--beta", default=1.0, type=float, help="hyperparameter beta")
-    parser.add_argument(
-        "--cutmix_prob", default=0.0, type=float, help="cutmix probability"
-    )
+    parser.add_argument("--improved", action="store_true")
     parser.add_argument(
         "--architecture",
         type=str,
-        default="swin",
-        choices=["swin", "levit", "cait", "S60"],
+        default="resnet18",
     )
-    parser.add_argument("--robust", action="store_true")
-
+    parser.add_argument("--strength", type=int, default=1, choices=[0, 1, 2, 3])
+    parser.add_argument("--noise-std", type=float, default=0.1)
+    parser.add_argument(
+        "--dataset-path",
+        default="/datasets01/tinyimagenet/081318/",
+        type=pathlib.Path,
+        choices=[
+            "/datasets01/tinyimagenet/081318/",
+            "/datasets01/imagenet_full_size/061417/",
+        ],
+    )
     omega.argparse.make_config(parser)
 
     args = parser.parse_args()
-    # if not args.robust and args.architecture == "swin":
-    #     args.learning_rate = 5e-4
-    # elif args.robust and args.architecture == "swin":
-    #     args.learning_rate = 5e-4
+    args.learning_rate = 5e-4
     args.weight_decay = 0.05
     args.grad_max_norm = 5.0
     args.epochs = 100
-    args.sync_batchnorm = True
     args.eval_each_epoch = True
-    args.batch_size = 512
-    if args.architecture == "S60":
-        args.batch_size = 256
+    args.batch_size = 128
 
     model = Model(args)
     executor = submitit.AutoExecutor(folder=model.args.folder)
@@ -204,8 +220,8 @@ if __name__ == "__main__":
         timeout_min=1400,
         slurm_signal_delay_s=120,
         nodes=1,
-        gpus_per_node=8,
-        tasks_per_node=8,
+        gpus_per_node=2,
+        tasks_per_node=2,
         cpus_per_task=10,
         slurm_partition="learnlab",
         name="test",

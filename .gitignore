@@ -1,3 +1,5 @@
+examples/*.png
+*.npz
 *.out
 .vscode
 */logging

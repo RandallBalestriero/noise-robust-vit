@@ -1,288 +1,587 @@
-from math import ceil
+# Copyright (c) 2015-present, Facebook, Inc.
+# All rights reserved.
+
+# Modified from
+# https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/vision_transformer.py
+# Copyright 2020 Ross Wightman, Apache-2.0 License
 
 import torch
-from torch import nn, einsum
-import torch.nn.functional as F
-
-from einops import rearrange, repeat
-from einops.layers.torch import Rearrange
-from .utils import SinkhornAttention
-
-# helpers
+import itertools
+from .utils import trunc_normal_
 
 
-def exists(val):
-    return val is not None
+specification = {
+    "LeViT_128S": {
+        "C": "128_256_384",
+        "D": 16,
+        "N": "4_6_8",
+        "X": "2_3_4",
+        "drop_path": 0,
+    },
+    "LeViT_128": {
+        "C": "128_256_384",
+        "D": 16,
+        "N": "4_8_12",
+        "X": "4_4_4",
+        "drop_path": 0,
+    },
+    "LeViT_192": {
+        "C": "192_288_384",
+        "D": 32,
+        "N": "3_5_6",
+        "X": "4_4_4",
+        "drop_path": 0,
+    },
+    "LeViT_256": {
+        "C": "256_384_512",
+        "D": 32,
+        "N": "4_6_8",
+        "X": "4_4_4",
+        "drop_path": 0,
+    },
+    "LeViT_384": {
+        "C": "384_512_768",
+        "D": 32,
+        "N": "6_9_12",
+        "X": "4_4_4",
+        "drop_path": 0.1,
+    },
+}
+
+__all__ = [specification.keys()]
 
 
-def default(val, d):
-    return val if exists(val) else d
+FLOPS_COUNTER = 0
 
 
-def cast_tuple(val, l=3):
-    val = val if isinstance(val, tuple) else (val,)
-    return (*val, *((val[-1],) * max(l - len(val), 0)))
-
-
-def always(val):
-    return lambda *args, **kwargs: val
-
-
-# classes
-
-
-class FeedForward(nn.Module):
-    def __init__(self, dim, mult, dropout=0.0):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(dim, dim * mult, 1),
-            nn.Hardswish(),
-            nn.Dropout(dropout),
-            nn.Conv2d(dim * mult, dim, 1),
-            nn.Dropout(dropout),
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class Attention(nn.Module):
+class Conv2d_BN(torch.nn.Sequential):
     def __init__(
         self,
-        dim,
-        fmap_size,
-        heads=8,
-        dim_key=32,
-        dim_value=64,
-        dropout=0.0,
-        dim_out=None,
-        downsample=False,
-        robust=False,
+        a,
+        b,
+        ks=1,
+        stride=1,
+        pad=0,
+        dilation=1,
+        groups=1,
+        bn_weight_init=1,
+        resolution=-10000,
     ):
         super().__init__()
-        inner_dim_key = dim_key * heads
-        inner_dim_value = dim_value * heads
-        dim_out = default(dim_out, dim)
-
-        self.heads = heads
-        self.scale = dim_key**-0.5
-
-        self.to_q = nn.Sequential(
-            nn.Conv2d(
-                dim, inner_dim_key, 1, stride=(2 if downsample else 1), bias=False
-            ),
-            nn.BatchNorm2d(inner_dim_key),
+        self.add_module(
+            "c", torch.nn.Conv2d(a, b, ks, stride, pad, dilation, groups, bias=False)
         )
-        self.to_k = nn.Sequential(
-            nn.Conv2d(dim, inner_dim_key, 1, bias=False), nn.BatchNorm2d(inner_dim_key)
-        )
-        self.to_v = nn.Sequential(
-            nn.Conv2d(dim, inner_dim_value, 1, bias=False),
-            nn.BatchNorm2d(inner_dim_value),
-        )
+        bn = torch.nn.BatchNorm2d(b)
+        torch.nn.init.constant_(bn.weight, bn_weight_init)
+        torch.nn.init.constant_(bn.bias, 0)
+        self.add_module("bn", bn)
 
-        if robust:
-            self.attend = SinkhornAttention(-1)
+        global FLOPS_COUNTER
+        output_points = (
+            (resolution + 2 * pad - dilation * (ks - 1) - 1) // stride + 1
+        ) ** 2
+        FLOPS_COUNTER += a * b * output_points * (ks**2) // groups
+
+    @torch.no_grad()
+    def fuse(self):
+        c, bn = self._modules.values()
+        w = bn.weight / (bn.running_var + bn.eps) ** 0.5
+        w = c.weight * w[:, None, None, None]
+        b = bn.bias - bn.running_mean * bn.weight / (bn.running_var + bn.eps) ** 0.5
+        m = torch.nn.Conv2d(
+            w.size(1) * self.c.groups,
+            w.size(0),
+            w.shape[2:],
+            stride=self.c.stride,
+            padding=self.c.padding,
+            dilation=self.c.dilation,
+            groups=self.c.groups,
+        )
+        m.weight.data.copy_(w)
+        m.bias.data.copy_(b)
+        return m
+
+
+class Linear_BN(torch.nn.Sequential):
+    def __init__(self, a, b, bn_weight_init=1, resolution=-100000):
+        super().__init__()
+        self.add_module("c", torch.nn.Linear(a, b, bias=False))
+        bn = torch.nn.BatchNorm1d(b)
+        torch.nn.init.constant_(bn.weight, bn_weight_init)
+        torch.nn.init.constant_(bn.bias, 0)
+        self.add_module("bn", bn)
+
+        global FLOPS_COUNTER
+        output_points = resolution**2
+        FLOPS_COUNTER += a * b * output_points
+
+    @torch.no_grad()
+    def fuse(self):
+        l, bn = self._modules.values()
+        w = bn.weight / (bn.running_var + bn.eps) ** 0.5
+        w = l.weight * w[:, None]
+        b = bn.bias - bn.running_mean * bn.weight / (bn.running_var + bn.eps) ** 0.5
+        m = torch.nn.Linear(w.size(1), w.size(0))
+        m.weight.data.copy_(w)
+        m.bias.data.copy_(b)
+        return m
+
+    def forward(self, x):
+        l, bn = self._modules.values()
+        x = l(x)
+        return bn(x.flatten(0, 1)).reshape_as(x)
+
+
+class BN_Linear(torch.nn.Sequential):
+    def __init__(self, a, b, bias=True, std=0.02):
+        super().__init__()
+        self.add_module("bn", torch.nn.BatchNorm1d(a))
+        l = torch.nn.Linear(a, b, bias=bias)
+        trunc_normal_(l.weight, std=std)
+        if bias:
+            torch.nn.init.constant_(l.bias, 0)
+        self.add_module("l", l)
+        global FLOPS_COUNTER
+        FLOPS_COUNTER += a * b
+
+    @torch.no_grad()
+    def fuse(self):
+        bn, l = self._modules.values()
+        w = bn.weight / (bn.running_var + bn.eps) ** 0.5
+        b = (
+            bn.bias
+            - self.bn.running_mean * self.bn.weight / (bn.running_var + bn.eps) ** 0.5
+        )
+        w = l.weight * w[None, :]
+        if l.bias is None:
+            b = b @ self.l.weight.T
         else:
-            self.attend = nn.Softmax(dim=-1)
+            b = (l.weight @ b[:, None]).view(-1) + self.l.bias
+        m = torch.nn.Linear(w.size(1), w.size(0))
+        m.weight.data.copy_(w)
+        m.bias.data.copy_(b)
+        return m
 
-        self.dropout = nn.Dropout(dropout)
 
-        out_batch_norm = nn.BatchNorm2d(dim_out)
-        nn.init.zeros_(out_batch_norm.weight)
+def b16(n, activation, resolution=224):
+    return torch.nn.Sequential(
+        Conv2d_BN(3, n // 8, 3, 2, 1, resolution=resolution),
+        activation(),
+        Conv2d_BN(n // 8, n // 4, 3, 2, 1, resolution=resolution // 2),
+        activation(),
+        Conv2d_BN(n // 4, n // 2, 3, 2, 1, resolution=resolution // 4),
+        activation(),
+        Conv2d_BN(n // 2, n, 3, 2, 1, resolution=resolution // 8),
+    )
 
-        self.to_out = nn.Sequential(
-            nn.GELU(),
-            nn.Conv2d(inner_dim_value, dim_out, 1),
-            out_batch_norm,
-            nn.Dropout(dropout),
-        )
 
-        # positional bias
-
-        self.pos_bias = nn.Embedding(fmap_size * fmap_size, heads)
-
-        q_range = torch.arange(0, fmap_size, step=(2 if downsample else 1))
-        k_range = torch.arange(fmap_size)
-
-        q_pos = torch.stack(torch.meshgrid(q_range, q_range, indexing="ij"), dim=-1)
-        k_pos = torch.stack(torch.meshgrid(k_range, k_range, indexing="ij"), dim=-1)
-
-        q_pos, k_pos = map(lambda t: rearrange(t, "i j c -> (i j) c"), (q_pos, k_pos))
-        rel_pos = (q_pos[:, None, ...] - k_pos[None, :, ...]).abs()
-
-        x_rel, y_rel = rel_pos.unbind(dim=-1)
-        pos_indices = (x_rel * fmap_size) + y_rel
-
-        self.register_buffer("pos_indices", pos_indices)
-
-    def apply_pos_bias(self, fmap):
-        bias = self.pos_bias(self.pos_indices)
-        bias = rearrange(bias, "i j h -> () h i j")
-        return fmap + (bias / self.scale)
+class Residual(torch.nn.Module):
+    def __init__(self, m, drop):
+        super().__init__()
+        self.m = m
+        self.drop = drop
 
     def forward(self, x):
-        b, n, *_, h = *x.shape, self.heads
-
-        q = self.to_q(x)
-        y = q.shape[2]
-
-        qkv = (q, self.to_k(x), self.to_v(x))
-        q, k, v = map(lambda t: rearrange(t, "b (h d) ... -> b h (...) d", h=h), qkv)
-
-        dots = einsum("b h i d, b h j d -> b h i j", q, k) * self.scale
-
-        dots = self.apply_pos_bias(dots)
-
-        attn = self.attend(dots)
-        attn = self.dropout(attn)
-
-        out = einsum("b h i j, b h j d -> b h i d", attn, v)
-        out = rearrange(out, "b h (x y) d -> b (h d) x y", h=h, y=y)
-        return self.to_out(out)
+        if self.training and self.drop > 0:
+            return (
+                x
+                + self.m(x)
+                * torch.rand(x.size(0), 1, 1, device=x.device)
+                .ge_(self.drop)
+                .div(1 - self.drop)
+                .detach()
+            )
+        else:
+            return x + self.m(x)
 
 
-class Transformer(nn.Module):
+class Attention(torch.nn.Module):
     def __init__(
         self,
         dim,
-        fmap_size,
-        depth,
-        heads,
-        dim_key,
-        dim_value,
-        mlp_mult=2,
-        dropout=0.0,
-        dim_out=None,
-        downsample=False,
+        key_dim,
+        num_heads=8,
+        attn_ratio=4,
+        activation=None,
+        resolution=14,
         robust=False,
     ):
         super().__init__()
-        dim_out = default(dim_out, dim)
-        self.layers = nn.ModuleList([])
-        self.attn_residual = (not downsample) and dim == dim_out
+        self.num_heads = num_heads
+        self.robust = robust
+        self.scale = key_dim**-0.5
+        self.key_dim = key_dim
+        self.nh_kd = nh_kd = key_dim * num_heads
+        self.d = int(attn_ratio * key_dim)
+        self.dh = int(attn_ratio * key_dim) * num_heads
+        self.attn_ratio = attn_ratio
+        h = self.dh + nh_kd * 2
+        self.qkv = Linear_BN(dim, h, resolution=resolution)
+        self.proj = torch.nn.Sequential(
+            activation(),
+            Linear_BN(self.dh, dim, bn_weight_init=0, resolution=resolution),
+        )
 
-        for _ in range(depth):
-            self.layers.append(
-                nn.ModuleList(
-                    [
-                        Attention(
-                            dim,
-                            fmap_size=fmap_size,
-                            heads=heads,
-                            dim_key=dim_key,
-                            dim_value=dim_value,
-                            dropout=dropout,
-                            downsample=downsample,
-                            dim_out=dim_out,
-                            robust=robust,
-                        ),
-                        FeedForward(dim_out, mlp_mult, dropout=dropout),
-                    ]
-                )
-            )
+        points = list(itertools.product(range(resolution), range(resolution)))
+        N = len(points)
+        attention_offsets = {}
+        idxs = []
+        for p1 in points:
+            for p2 in points:
+                offset = (abs(p1[0] - p2[0]), abs(p1[1] - p2[1]))
+                if offset not in attention_offsets:
+                    attention_offsets[offset] = len(attention_offsets)
+                idxs.append(attention_offsets[offset])
+        self.attention_biases = torch.nn.Parameter(
+            torch.zeros(num_heads, len(attention_offsets))
+        )
+        self.register_buffer("attention_bias_idxs", torch.LongTensor(idxs).view(N, N))
 
-    def forward(self, x):
-        for attn, ff in self.layers:
-            attn_res = x if self.attn_residual else 0
-            x = attn(x) + attn_res
-            x = ff(x) + x
+        global FLOPS_COUNTER
+        # queries * keys
+        FLOPS_COUNTER += num_heads * (resolution**4) * key_dim
+        # softmax
+        FLOPS_COUNTER += num_heads * (resolution**4)
+        # attention * v
+        FLOPS_COUNTER += num_heads * self.d * (resolution**4)
+
+    @torch.no_grad()
+    def train(self, mode=True):
+        super().train(mode)
+        if mode and hasattr(self, "ab"):
+            del self.ab
+        else:
+            self.ab = self.attention_biases[:, self.attention_bias_idxs]
+
+    def forward(self, x):  # x (B,N,C)
+        B, N, C = x.shape
+        qkv = self.qkv(x)
+        q, k, v = qkv.view(B, N, self.num_heads, -1).split(
+            [self.key_dim, self.key_dim, self.d], dim=3
+        )
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale + (
+            self.attention_biases[:, self.attention_bias_idxs]
+            if self.training
+            else self.ab
+        )
+        if not self.robust:
+            attn = attn.softmax(dim=-1)
+        else:
+            attn = torch.nn.functional.softmax(attn, dim=-1)
+            for _ in range(3):
+                attn = attn.div(torch.sum(attn, dim=-1, keepdim=True))
+                attn = attn.div(torch.sum(attn, dim=-2, keepdim=True))
+            attn = attn.div(torch.sum(attn, dim=-1, keepdim=True))
+        x = (attn @ v).transpose(1, 2).reshape(B, N, self.dh)
+        x = self.proj(x)
         return x
 
 
-class LeViT(nn.Module):
+class Subsample(torch.nn.Module):
+    def __init__(self, stride, resolution):
+        super().__init__()
+        self.stride = stride
+        self.resolution = resolution
+
+    def forward(self, x):
+        B, N, C = x.shape
+        x = x.view(B, self.resolution, self.resolution, C)[
+            :, :: self.stride, :: self.stride
+        ].reshape(B, -1, C)
+        return x
+
+
+class AttentionSubsample(torch.nn.Module):
     def __init__(
         self,
-        *,
-        image_size,
-        num_classes,
-        dim,
-        depth,
-        heads,
-        mlp_mult,
-        stages=3,
-        dim_key=32,
-        dim_value=64,
-        dropout=0.0,
-        num_distill_classes=None,
-        robust=False
+        in_dim,
+        out_dim,
+        key_dim,
+        num_heads=8,
+        attn_ratio=2,
+        activation=None,
+        stride=2,
+        resolution=14,
+        resolution_=7,
+        robust=False,
     ):
         super().__init__()
+        self.robust = robust
+        self.num_heads = num_heads
+        self.scale = key_dim**-0.5
+        self.key_dim = key_dim
+        self.nh_kd = nh_kd = key_dim * num_heads
+        self.d = int(attn_ratio * key_dim)
+        self.dh = int(attn_ratio * key_dim) * self.num_heads
+        self.attn_ratio = attn_ratio
+        self.resolution_ = resolution_
+        self.resolution_2 = resolution_**2
+        h = self.dh + nh_kd
+        self.kv = Linear_BN(in_dim, h, resolution=resolution)
 
-        dims = cast_tuple(dim, stages)
-        depths = cast_tuple(depth, stages)
-        layer_heads = cast_tuple(heads, stages)
-
-        assert all(
-            map(lambda t: len(t) == stages, (dims, depths, layer_heads))
-        ), "dimensions, depths, and heads must be a tuple that is less than the designated number of stages"
-
-        self.conv_embedding = nn.Sequential(
-            nn.Conv2d(3, 32, 3, stride=2, padding=1),
-            nn.Conv2d(32, 64, 3, stride=2, padding=1),
-            nn.Conv2d(64, 128, 3, stride=2, padding=1),
-            nn.Conv2d(128, dims[0], 3, stride=2, padding=1),
+        self.q = torch.nn.Sequential(
+            Subsample(stride, resolution),
+            Linear_BN(in_dim, nh_kd, resolution=resolution_),
+        )
+        self.proj = torch.nn.Sequential(
+            activation(), Linear_BN(self.dh, out_dim, resolution=resolution_)
         )
 
-        fmap_size = image_size // (2**4)
-        layers = []
-
-        for ind, (dim, depth, heads) in enumerate(zip(dims, depths, layer_heads)):
-            layers.append(
-                Transformer(
-                    dim,
-                    fmap_size,
-                    depth,
-                    heads,
-                    dim_key,
-                    dim_value,
-                    mlp_mult,
-                    dropout,
-                    robust,
+        self.stride = stride
+        self.resolution = resolution
+        points = list(itertools.product(range(resolution), range(resolution)))
+        points_ = list(itertools.product(range(resolution_), range(resolution_)))
+        N = len(points)
+        N_ = len(points_)
+        attention_offsets = {}
+        idxs = []
+        for p1 in points_:
+            for p2 in points:
+                size = 1
+                offset = (
+                    abs(p1[0] * stride - p2[0] + (size - 1) / 2),
+                    abs(p1[1] * stride - p2[1] + (size - 1) / 2),
                 )
-            )
+                if offset not in attention_offsets:
+                    attention_offsets[offset] = len(attention_offsets)
+                idxs.append(attention_offsets[offset])
+        self.attention_biases = torch.nn.Parameter(
+            torch.zeros(num_heads, len(attention_offsets))
+        )
+        self.register_buffer("attention_bias_idxs", torch.LongTensor(idxs).view(N_, N))
 
-            if ind == (stages - 1):
-                next_dim = dims[ind + 1]
-                layers.append(
-                    Transformer(
-                        dim,
-                        fmap_size,
-                        1,
-                        heads * 2,
-                        dim_key,
-                        dim_value,
-                        dim_out=next_dim,
-                        downsample=True,
-                        robust=robust,
+        global FLOPS_COUNTER
+        # queries * keys
+        FLOPS_COUNTER += num_heads * (resolution**2) * (resolution_**2) * key_dim
+        # softmax
+        FLOPS_COUNTER += num_heads * (resolution**2) * (resolution_**2)
+        # attention * v
+        FLOPS_COUNTER += num_heads * (resolution**2) * (resolution_**2) * self.d
+
+    @torch.no_grad()
+    def train(self, mode=True):
+        super().train(mode)
+        if mode and hasattr(self, "ab"):
+            del self.ab
+        else:
+            self.ab = self.attention_biases[:, self.attention_bias_idxs]
+
+    def forward(self, x):
+        B, N, C = x.shape
+        k, v = (
+            self.kv(x)
+            .view(B, N, self.num_heads, -1)
+            .split([self.key_dim, self.d], dim=3)
+        )
+        k = k.permute(0, 2, 1, 3)  # BHNC
+        v = v.permute(0, 2, 1, 3)  # BHNC
+        q = (
+            self.q(x)
+            .view(B, self.resolution_2, self.num_heads, self.key_dim)
+            .permute(0, 2, 1, 3)
+        )
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale + (
+            self.attention_biases[:, self.attention_bias_idxs]
+            if self.training
+            else self.ab
+        )
+        if not self.robust:
+            attn = attn.softmax(dim=-1)
+        else:
+            attn = torch.nn.functional.softmax(attn, dim=-1)
+            for _ in range(3):
+                attn = attn.div(torch.sum(attn, dim=-1, keepdim=True))
+                attn = attn.div(torch.sum(attn, dim=-2, keepdim=True))
+            attn = attn.div(torch.sum(attn, dim=-1, keepdim=True))
+        x = (attn @ v).transpose(1, 2).reshape(B, -1, self.dh)
+        x = self.proj(x)
+        return x
+
+
+class LeViT(torch.nn.Module):
+    """Vision Transformer with support for patch or hybrid CNN input stage"""
+
+    def __init__(
+        self,
+        img_size=224,
+        patch_size=16,
+        in_chans=3,
+        num_classes=1000,
+        embed_dim=[192],
+        key_dim=[64],
+        depth=[12],
+        num_heads=[3],
+        attn_ratio=[2],
+        mlp_ratio=[2],
+        hybrid_backbone=None,
+        down_ops=[],
+        attention_activation=torch.nn.Hardswish,
+        mlp_activation=torch.nn.Hardswish,
+        drop_path=0,
+        robust=False,
+    ):
+        super().__init__()
+        global FLOPS_COUNTER
+
+        self.num_classes = num_classes
+        self.num_features = embed_dim[-1]
+        self.embed_dim = embed_dim
+
+        self.patch_embed = hybrid_backbone
+
+        self.blocks = []
+        down_ops.append([""])
+        resolution = img_size // patch_size
+        for i, (ed, kd, dpth, nh, ar, mr, do) in enumerate(
+            zip(embed_dim, key_dim, depth, num_heads, attn_ratio, mlp_ratio, down_ops)
+        ):
+            for _ in range(dpth):
+                self.blocks.append(
+                    Residual(
+                        Attention(
+                            ed,
+                            kd,
+                            nh,
+                            attn_ratio=ar,
+                            activation=attention_activation,
+                            resolution=resolution,
+                            robust=robust,
+                        ),
+                        drop_path,
                     )
                 )
-                fmap_size = ceil(fmap_size / 2)
+                if mr > 0:
+                    h = int(ed * mr)
+                    self.blocks.append(
+                        Residual(
+                            torch.nn.Sequential(
+                                Linear_BN(ed, h, resolution=resolution),
+                                mlp_activation(),
+                                Linear_BN(
+                                    h, ed, bn_weight_init=0, resolution=resolution
+                                ),
+                            ),
+                            drop_path,
+                        )
+                    )
+            if do[0] == "Subsample":
+                # ('Subsample',key_dim, num_heads, attn_ratio, mlp_ratio, stride)
+                resolution_ = (resolution - 1) // do[5] + 1
+                self.blocks.append(
+                    AttentionSubsample(
+                        *embed_dim[i : i + 2],
+                        key_dim=do[1],
+                        num_heads=do[2],
+                        attn_ratio=do[3],
+                        activation=attention_activation,
+                        stride=do[5],
+                        resolution=resolution,
+                        resolution_=resolution_,
+                        robust=robust
+                    )
+                )
+                resolution = resolution_
+                if do[4] > 0:  # mlp_ratio
+                    h = int(embed_dim[i + 1] * do[4])
+                    self.blocks.append(
+                        Residual(
+                            torch.nn.Sequential(
+                                Linear_BN(embed_dim[i + 1], h, resolution=resolution),
+                                mlp_activation(),
+                                Linear_BN(
+                                    h,
+                                    embed_dim[i + 1],
+                                    bn_weight_init=0,
+                                    resolution=resolution,
+                                ),
+                            ),
+                            drop_path,
+                        )
+                    )
+        self.blocks = torch.nn.Sequential(*self.blocks)
 
-        self.backbone = nn.Sequential(*layers)
-
-        self.pool = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1), Rearrange("... () () -> ...")
+        # Classifier head
+        self.head = (
+            BN_Linear(embed_dim[-1], num_classes)
+            if num_classes > 0
+            else torch.nn.Identity()
         )
 
-        self.distill_head = (
-            nn.Linear(dim, num_distill_classes)
-            if exists(num_distill_classes)
-            else always(None)
-        )
-        self.mlp_head = nn.Linear(dim, num_classes)
+        self.FLOPS = FLOPS_COUNTER
+        FLOPS_COUNTER = 0
 
-    def forward(self, img):
-        x = self.conv_embedding(img)
+    @torch.jit.ignore
+    def no_weight_decay(self):
+        return {x for x in self.state_dict().keys() if "attention_biases" in x}
 
-        x = self.backbone(x)
+    def forward(self, x):
+        x = self.patch_embed(x)
+        x = x.flatten(2).transpose(1, 2)
+        x = self.blocks(x)
+        x = x.mean(1)
+        x = self.head(x)
+        return x
 
-        x = self.pool(x)
 
-        out = self.mlp_head(x)
-        distill = self.distill_head(x)
+def model_factory(C, D, X, N, drop_path, num_classes, fuse, robust):
+    embed_dim = [int(x) for x in C.split("_")]
+    num_heads = [int(x) for x in N.split("_")]
+    depth = [int(x) for x in X.split("_")]
+    act = torch.nn.Hardswish
+    model = LeViT(
+        patch_size=16,
+        embed_dim=embed_dim,
+        num_heads=num_heads,
+        key_dim=[D] * 3,
+        depth=depth,
+        attn_ratio=[2, 2, 2],
+        mlp_ratio=[2, 2, 2],
+        down_ops=[
+            # ('Subsample',key_dim, num_heads, attn_ratio, mlp_ratio, stride)
+            ["Subsample", D, embed_dim[0] // D, 4, 2, 2],
+            ["Subsample", D, embed_dim[1] // D, 4, 2, 2],
+        ],
+        attention_activation=act,
+        mlp_activation=act,
+        hybrid_backbone=b16(embed_dim[0], activation=act),
+        num_classes=num_classes,
+        drop_path=drop_path,
+        robust=robust,
+    )
 
-        if exists(distill):
-            return out, distill
+    return model
 
-        return out
+
+def LeViT_128S(num_classes=1000, fuse=False, robust=False):
+    return model_factory(
+        **specification["LeViT_128S"], num_classes=num_classes, fuse=fuse, robust=robust
+    )
+
+
+def LeViT_128(num_classes=1000, fuse=False, robust=False):
+    return model_factory(
+        **specification["LeViT_128"], num_classes=num_classes, fuse=fuse, robust=robust
+    )
+
+
+def LeViT_192(num_classes=1000, fuse=False, robust=False):
+    return model_factory(
+        **specification["LeViT_192"], num_classes=num_classes, fuse=fuse, robust=robust
+    )
+
+
+def LeViT_256(num_classes=1000, fuse=False, robust=False):
+    return model_factory(
+        **specification["LeViT_256"], num_classes=num_classes, fuse=fuse, robust=robust
+    )
+
+
+def LeViT_384(num_classes=1000, fuse=False, robust=False):
+    return model_factory(
+        **specification["LeViT_384"], num_classes=num_classes, fuse=fuse, robust=robust
+    )
